@@ -4,6 +4,7 @@
 #include <mutex>
 #include <stdexcept>
 #include <thread>
+#include <assert.h>
 
 template <typename T, uint64_t SIZE = 4096, uint64_t MAX_SPIN_ON_BUSY = 40000000>
 class ConcurrentQueue
@@ -33,13 +34,13 @@ public: // made it public to implement test-cases
 
 public:
     const T &pop()
-    { // returning constant link for mutable data doesn't look safe
+    { // returning const ref for mutable data doesn't look safe
         // if:
         // 1) only 1 consumer
         // 2) peek is public (means it's supposed to be used from external code)
         // then no need for double-checking inside the pop func
-        // it can be threaded as 'easy check without sync' in hope that non-atomic counters might get sync eventually without explicit sync mechanism (such as mutex),
-        // but in fact it's UB
+        // it can be threated as 'lightweight check without sync' with a hope that non-atomic counters might get sync eventually without explicit sync mechanism (such as mutex),
+        // but it's UB
         if (!peek())
         {
             return mEmpty;
@@ -65,12 +66,12 @@ public:
 
     uint64_t getCount() const
     {
-        // read access by producer without mutex
-        // (consumer is supposed to change the value to break busyWaitForPush loop)
+        // reading access by producer without mutex
+        // (consumer can change the value and break busyWaitForPush loop)
 
         // result doesn't look right:
         // consider the case after first uint64-loop:
-        // mWrite = 5, mRead = 2^64 - 1. size = 2^64 - 1 - 5?? should be about 6
+        // mWrite = 5, mRead = 2^64 - 1. getCount = 2^64 - 1 - 5?? should be about 6
         return mWritePtr > mReadPtr ? mWritePtr - mReadPtr : mReadPtr - mWritePtr;
     }
 
@@ -249,8 +250,8 @@ int main(int, char **)
 }
 
 // So generally I see 4 problems here:
-// 1) returning link to mutable variable (const T& pop())
-// 2) unsynchronised access to non-atomic variables
+// 1) returning a ref to mutable variable (const T& pop())
+// 2) non-synchronized access to non-atomic variables
 // 3) wrong getCount() calculation
 // 4) mistake in closestExponentOf2() func
 // 5) default constuctor for std::function
@@ -260,17 +261,18 @@ int main(int, char **)
 // Answers for the questions:
 
 // What changes would you suggest in a code review? Would you check in your code like this? Do you think the code is clean?
-// Everything is explained in a comments to the code
+// Everything is explained in the comments to the code
 
 // Do you see room for improving the performance without breaking thread safety?
 // There are few UB places, so it's hard to test the performance...
 
 // What steps would you take to find the bug?
-// Read the code attentively -> reproduce (run the example) -> detect suspicious places -> write a tests to ensure that there is a bug
+// Read the code attentively -> reproduce (run the example) -> detect suspicious places -> write a tests to confirm there is a bug
 
 // If you can find the bug, what fix would you suggest? Write a proper test case to prove that the bug is solved (may be in pseudo code), preferably in a deterministic matter?
 // there is a couple of tests for reproducing (reproduceBrokenLink(), reproduceWrongSize(), reproduceMultiPushProblem(), static_asserts for closestExponentOf2()). Only reproduceBrokenLink() reproduce the problem determinately.
 
 // If you cannot find the bug, how would you go about testing the thread safety of the class
 // For thread-safe problem, the best option I know is sanitizers (-fsanitize=thread) and load testings - run many threads, compare initial and final state (all produced tasks were received).
-// It's hard to write proper load tests here without updating the code (we get a segfault pretty soon)
+// Aditionally, some metrics and side-effect can be done to check internal state/behaviour.
+// It's hard to write proper load tests here without updating the code (we usually get a segfault very soon)

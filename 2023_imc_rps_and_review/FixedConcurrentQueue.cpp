@@ -5,6 +5,7 @@
 #include <mutex>
 #include <stdexcept>
 #include <thread>
+#include <assert.h>
 
 namespace {
     template<uint64_t x>
@@ -19,9 +20,9 @@ namespace {
 }
 
 // seems about 10-20% slower then the quick-fixed original, but it's hard to compare because of UB in originals
-// https://quick-bench.com/q/89s8bkNjUCs5bl71E8ydH1gn8mo
+// https://quick-bench.com/q/s0Tm7vbCHDfAD6WrxLkF7dVjbag
 template<typename T, uint64_t SIZE = 4096, uint64_t MAX_SPIN_ON_BUSY = 40000000>
-class ConcurrentQueue {
+class FixedConcurrentQueue {
 private:
     static constexpr uint64_t mRingModMask = closestExponentOf2<SIZE>() - 1;
     static constexpr uint64_t mSize = closestExponentOf2<SIZE>();
@@ -33,18 +34,30 @@ private:
 
 public:
     bool pop(T& dest) {
-        if (mReadPtr != mWritePtr) {
-            dest = std::move(mMem[mReadPtr & mRingModMask]);
-            mReadPtr++; // can't increment it in previous line because then producer can overwrite the value
-            return true;
+        if (mReadPtr == mWritePtr) {
+            return false;
         }
-        return false;
+
+        dest = std::move(mMem[mReadPtr & mRingModMask]);
+        mReadPtr++; // can't increment it in previous line because then producer can overwrite the value
+        return true;
+    }
+
+    template<typename U>
+    void push(U&& pItem) {
+        auto lock = std::unique_lock(mMtx);
+        if (size() == mSize && !busyWaitForPush()) { // quick check without func call first
+            throw std::runtime_error("Concurrent queue full cannot write to it!");
+        }
+        mMem[mWritePtr & mRingModMask] = std::forward<U>(pItem);
+        mWritePtr++;
     }
 
     uint64_t size() const {
         return mWritePtr - mReadPtr;
     }
 
+private:
     bool busyWaitForPush() {
         uint64_t start = 0;
         while (size() == mSize) {
@@ -53,24 +66,6 @@ public:
             }
         }
         return true;
-    }
-
-    void push(const T& pItem) {
-        auto lock = std::unique_lock(mMtx);
-        if (size() == mSize && !busyWaitForPush()) { // quick check without func call first
-            throw std::runtime_error("Concurrent queue full cannot write to it!");
-        }
-        mMem[mWritePtr & mRingModMask] = pItem;
-        mWritePtr++;
-    }
-
-    void push(T&& pItem) {
-        auto lock = std::unique_lock(mMtx);
-        if (size() == mSize && !busyWaitForPush()) { // quick check without func call first
-            throw std::runtime_error("Concurrent queue full cannot write to it!");
-        }
-        mMem[mWritePtr & mRingModMask] = std::move(pItem);
-        mWritePtr++;
     }
 };
 
@@ -86,7 +81,7 @@ static_assert(closestExponentOf2<4096>() == 4096);
 void reproduceWrongSize() {
     using Functor = std::function<void()>;
 
-    ConcurrentQueue<Functor*, 4096> queue;
+    FixedConcurrentQueue<Functor*, 4096> queue;
 
     std::atomic_bool producerDone = false;
     std::thread producer([ & ] {
@@ -117,7 +112,7 @@ void reproduceBrokenLink() {
     // task return some number to check
     using Functor = std::function<int()>;
 
-    ConcurrentQueue<Functor*, 1> queue;
+    FixedConcurrentQueue<Functor*, 1> queue;
     queue.push(new Functor([ = ] {return 1;}));
 
     // get task
@@ -131,46 +126,41 @@ void reproduceBrokenLink() {
     assert(res == 1);
 }
 
+using Functor = std::function<void()>;
+
+void push_tasks(FixedConcurrentQueue<Functor*>& queue, size_t count, std::string_view tag) {
+    auto counter = 0;
+    while (counter < count) {
+        auto newTask = new Functor([ = ] {
+            std::this_thread::yield(); // some delay to give consumer a chance
+            std::cout << "Running " << tag << " " << counter << std::endl << std::flush;
+        });
+        counter++;
+        queue.push(newTask);
+    }
+}
+
 int main(int, char**) {
     reproduceBrokenLink();
     // reproduceWrongSize();
     // return 0;
-    using Functor = std::function<void()>;
-    ConcurrentQueue<Functor*> queue;
+    FixedConcurrentQueue<Functor*> queue;
 
-    std::thread consumer([ & ] {
+    auto tasks_per_producer = 1000000;
+
+    std::jthread consumer([ & ] {
         Functor* task = nullptr;
-        while (true) {
+        uint64_t counter = 0;
+        while (counter < tasks_per_producer * 2) {
             if (queue.pop(task)) {
                 (*task)();
                 delete task;
+                counter++;
             }
         }
     });
 
-    std::thread producer1([ & ] {
-        uint64_t counter = 0;
-        while (true) {
-            auto taskId = counter++;
-            auto newTask = new Functor([ = ] {
-                std::cout << "Running task1 " << taskId << std::endl << std::flush;
-            });
-            queue.push(newTask);
-        }
-    });
-    std::thread producer2([ & ] {
-        uint64_t counter = 0;
-        while (true) {
-            auto taskId = counter++;
-            auto newTask = new Functor([ = ] {
-                std::cout << "Running task2 " << taskId << std::endl << std::flush;
-            });
-            queue.push(newTask);
-        }
-    });
-
-    consumer.join();
-    producer1.join();
-    producer2.join();
+    std::jthread producer1(&push_tasks, std::ref(queue), tasks_per_producer, "task1");
+    std::jthread producer2(&push_tasks, std::ref(queue), tasks_per_producer, "task2");
     return 0;
 }
